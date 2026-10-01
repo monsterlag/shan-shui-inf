@@ -1,3 +1,16 @@
+## Colour fork
+
+This fork adds colour and smooth scrolling to the original:
+
+- Four palettes, switchable live: blue-green (qinglu), autumn, snow, and the original ink.
+- Mountains carry colour washes that fade with distance; trees, roofs, water and figures have their own colours.
+- The page drifts on its own and can be dragged, swiped, scrolled, or moved with the arrow keys.
+- Painting runs in a web worker where available, and is time-sliced otherwise, so the page stays responsive.
+
+The landscape generator is Lingdong Huang's original code, modified. Original README follows.
+
+---
+
 # {Shan, Shui}*
 Procedurally-generated vector-format infinitely-scrolling Chinese landscape for the browser.
 Generate your own on https://lingdong-.github.io/shan-shui-inf/ (or [Alternative link](https://shan-shui-inf.glitch.me)).
