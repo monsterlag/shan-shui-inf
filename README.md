@@ -1,11 +1,13 @@
 ## Colour fork
 
-This fork adds colour and smooth scrolling to the original:
+This fork adds colour, smooth scrolling and seeded regional variety to the original:
 
-- Four palettes, switchable live: blue-green (qinglu), autumn, snow, and the original ink.
+- Four palettes: blue-green (qinglu), autumn, snow, and the original ink. Switching repaints the visible stretch and fades it in.
 - Mountains carry colour washes that fade with distance; trees, roofs, water and figures have their own colours.
-- The page drifts on its own and can be dragged, swiped, scrolled, or moved with the arrow keys.
-- Painting runs in a web worker where available, and is time-sliced otherwise, so the page stays responsive.
+- The landscape is drawn once onto bitmap tiles in a web worker, so scrolling only moves images. Without worker support, painting is time-sliced on the main thread.
+- Native scrolling (trackpad, touch, wheel, mouse drag, arrow keys), with a slow drift on top that pauses while you scroll.
+- A seeded generator with an independent random stream per feature: the same seed always gives the same scroll. Seeds are readable names such as `quiet-ridge-27`, editable on the page and stored in the URL (`#seed=...`).
+- Regions: the seed sets slowly shifting traits along the scroll, such as peak height, range density, open water, forest cover and villages.
 
 The landscape generator is Lingdong Huang's original code, modified. Original README follows.
 
