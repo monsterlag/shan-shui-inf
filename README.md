@@ -6,7 +6,7 @@ This fork adds colour, smooth scrolling and seeded regional variety to the origi
 - Mountains carry colour washes that fade with distance; trees, roofs, water and figures have their own colours.
 - The landscape is drawn once onto bitmap tiles in a web worker, so scrolling only moves images. Without worker support, painting is time-sliced on the main thread.
 - Finished tiles are added to the page in batches, and the scroll track grows in large steps, so the page changes as little as possible while a scroll is running.
-- Native scrolling (trackpad, touch, wheel, mouse drag, arrow keys), with a slow drift on top that pauses while you scroll.
+- Native scrolling (trackpad, touch, mouse drag, arrow keys), an eased glide for notched mouse wheels, and a slow drift on top that pauses while you scroll.
 - A seeded generator with an independent random stream per feature: the same seed always gives the same scroll. Seeds are readable names such as `quiet-ridge-27`, editable on the page and stored in the URL (`#seed=...`).
 - Regions: the seed sets slowly shifting traits along the scroll, such as peak height, range density, open water, forest cover and villages.
 

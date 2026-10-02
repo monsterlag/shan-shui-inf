@@ -4459,9 +4459,9 @@ function CORE(env) {
   var plans = E.plans;
   var feats = new Map(); // feature index -> flat draw ops
   var REACH = 1420; // furthest a feature can reach left of the slice that planned it
-  var P = 512, Hpx = 0, q = 1, TWu = 1, PAL = null, DPR = 1, grain = null;
+  var P = 512, Hpx = 0, q = 1, TWu = 1, PAL = null, DPR = 1, FRONT = 0, grain = null;
   var epoch = 0, layoutEp = 0;
-  var viewA = 0, viewB = 1;
+  var viewA = 0, viewB = 1, wantLo = 0, wantHi = 0; // want range in tile indices, set by the page
   var have = new Map(); // tile index -> epoch it was last drawn at
   var M_NONE = 255, M_WASH = 254, M_TEXT = 253;
   var CELL = 512, cells = new Map(), indexed = 0;
@@ -4491,31 +4491,32 @@ function CORE(env) {
 
   function msg(m) {
     if (m.t === "layout") {
-      P = m.P; Hpx = m.Hpx; q = m.q; TWu = P / q; DPR = m.dpr || 1;
+      P = m.P; Hpx = m.Hpx; q = m.q; TWu = P / q; DPR = m.dpr || 1; FRONT = m.front || 0;
       have.clear();
       epoch = m.ep; layoutEp++;
     } else if (m.t === "palette") {
       PAL = m.pal;
       epoch = m.ep;
     } else if (m.t === "view") {
-      viewA = m.a; viewB = m.b;
+      viewA = m.a; viewB = m.b; wantLo = m.lo; wantHi = m.hi;
     } else if (m.t === "drop") {
       for (var i = 0; i < m.ks.length; i++) have.delete(m.ks[i]);
     }
   }
+  // The page decides which tiles should exist (lo..hi) and never evicts inside that range,
+  // so the painter and the page cannot disagree and repaint each other's work forever.
   function range() {
-    var w = viewB - viewA;
     return {
       k0: Math.max(0, Math.floor(viewA / TWu)),
       k1: Math.max(0, Math.floor(viewB / TWu)),
-      ahead: Math.max(0, Math.floor((viewB + w * 2.5 + 300) / TWu)),
-      back: Math.max(0, Math.floor((viewA - w) / TWu)),
+      ahead: wantHi,
+      back: wantLo,
     };
   }
   function nextTile() {
     if (!PAL || !Hpx) return null;
     var r = range(), k;
-    for (k = r.k0; k <= r.k1; k++) if (have.get(k) !== epoch) return k;
+    for (k = Math.max(r.k0, r.back); k <= Math.min(r.k1, r.ahead); k++) if (have.get(k) !== epoch) return k;
     for (k = r.k1 + 1; k <= r.ahead; k++) if (have.get(k) !== epoch) return k;
     for (k = r.k0 - 1; k >= r.back; k--) if (have.get(k) !== epoch) return k;
     return null;
@@ -4596,10 +4597,11 @@ function CORE(env) {
     // paper grain over everything, anchored to the scroll so it runs unbroken across tiles
     try {
       if (!grain) grain = makeGrain(env.scratch(), 0.55);
-      ctx.setTransform(DPR, 0, 0, DPR, -k * P, 0);
+      // anchored at the scroll origin, like the CSS grain on bare paper, so the two line up
+      ctx.setTransform(DPR, 0, 0, DPR, -k * P - FRONT * DPR, 0);
       ctx.globalAlpha = 1;
       ctx.fillStyle = ctx.createPattern(grain, "repeat");
-      ctx.fillRect((k * P) / DPR, 0, P / DPR + 1, Hpx / DPR + 1);
+      ctx.fillRect((k * P) / DPR + FRONT, 0, P / DPR + 1, Hpx / DPR + 1);
     } catch (e) {}
     if (ep === epoch && lay === layoutEp) {
       have.set(k, ep);
@@ -4779,6 +4781,7 @@ function CORE(env) {
     root.setProperty("--paper", P.paper);
     root.setProperty("--front", mix(P.paper, "#ffffff", 0.3));
     send({ t: "palette", ep: ++epoch, pal: paletteTable(key) });
+    if (H) dropFarTiles(true);
   }
 
   Object.keys(PALETTES).forEach(function(key) {
@@ -4881,7 +4884,7 @@ function CORE(env) {
     tilesEl.style.left = frontPx + "px";
     view.style.setProperty("--H", H + "px");
     retireTiles(oldUnits);
-    send({ t: "layout", ep: ++epoch, P: TILE, Hpx: Hpx, q: Hpx / VB_H, dpr: dpr });
+    send({ t: "layout", ep: ++epoch, P: TILE, Hpx: Hpx, q: Hpx / VB_H, dpr: dpr, front: frontPx });
     // keep the same stretch of landscape in view across the resize
     var want = atStart ? 0 : Math.max(0, frontPx + worldLeft * s);
     driftPx = 0;
@@ -4891,6 +4894,7 @@ function CORE(env) {
     programmatic = performance.now();
     view.scrollLeft = want;
     growTrack(true);
+    dropHiddenStale();
     sendView(true);
     watchDpr();
   }
@@ -4916,7 +4920,7 @@ function CORE(env) {
   var stale = []; // tiles from before a resize, kept (stretched) until the new ones cover them
   var epoch = 0; // bumps on every layout or palette change; older tiles are discarded
   var lastFlush = 0, lastScrollEv = 0;
-  var received = 0, flushes = 0;
+  var received = 0, flushes = 0, repeats = 0, seenAt = new Map(); // test counters
   var FADE = 480;
 
   function clearTiles() {
@@ -4946,13 +4950,40 @@ function CORE(env) {
       st.el.style.height = H + "px";
     });
   }
+  function dropHiddenStale() {
+    stale = stale.filter(function(st) {
+      if (staleInView(st)) return true;
+      st.el.remove();
+      return false;
+    });
+  }
+  function staleInView(st) {
+    var a = (pos() - frontPx) / s, w = viewW / s;
+    return st.x1 > a - w * 0.25 && st.x0 < a + w * 1.25;
+  }
   function onTile(k, ep, source) {
     if (ep !== epoch) {
       if (source.close) source.close();
       return;
     }
     received++;
+    if (seenAt.get(k) === ep) repeats++;
+    seenAt.set(k, ep);
     pending.push({ k: k, ep: ep, source: source });
+  }
+  // The tiles the painter keeps ready: one view behind to two and a half ahead. Both sides
+  // use this one definition; the page sends it with every view update.
+  function wantRange() {
+    var p = pos() - frontPx;
+    return {
+      lo: Math.max(0, Math.floor((p - viewW) / tileCss)),
+      hi: Math.max(0, Math.floor((p + viewW * 3.5 + 300 * s) / tileCss)),
+    };
+  }
+  var sentRange = { lo: 0, hi: 0 }; // what the painter currently believes
+  function inView(k, margin) {
+    var x = k * tileCss, p = pos() - frontPx;
+    return x + tileCss > p - margin && x < p + viewW + margin;
   }
   function tileAtRightEdge() {
     return Math.floor((pos() + viewW - frontPx - 1) / tileCss);
@@ -4966,17 +4997,18 @@ function CORE(env) {
     if (now - lastScrollEv > 140) return true; // not scrolling: commits are free
     if (now - lastFlush > 500) return true;
     if (trackW < pos() + viewW * 2) return true;
-    // mid-scroll, only hurry for tiles the reader is about to see
-    var lo = pos() - frontPx - viewW * 0.3, hi = pos() - frontPx + viewW * 1.6;
+    // mid-scroll, only hurry for tiles the reader is about to see: the faster the scroll,
+    // the further ahead that reaches
+    var reach = Math.max(viewW * 0.6, scrollSpeed * 0.4);
     for (var i = 0; i < pending.length; i++) {
-      var x = pending[i].k * tileCss;
-      if (x + tileCss > lo && x < hi) return true;
+      if (inView(pending[i].k, reach)) return true;
     }
     return false;
   }
   function flush(now) {
     lastFlush = now;
     flushes++;
+    var scrolling = now - lastScrollEv < 140;
     for (var i = 0; i < pending.length; i++) {
       var p = pending[i];
       if (p.ep !== epoch) { if (p.source.close) p.source.close(); continue; }
@@ -4993,11 +5025,18 @@ function CORE(env) {
       el.style.left = p.k * tileCss + "px";
       el.style.width = tileCss + "px";
       el.style.height = H + "px";
-      if (!reduceMotion) el.className = "in";
+      // A fade is only worth its cost where it can be seen. Tiles mounted ahead of the view,
+      // or mounted while a scroll is running, appear at once: no half-faded tiles sliding
+      // into view, and no fade endings landing mid-scroll. Palette changes still cross-fade.
       var old = tiles.get(p.k);
-      if (old) dying.push({ el: old.el, at: now });
+      var fade = !reduceMotion && inView(p.k, 0) && (!!old || !scrolling);
+      el.className = fade ? "in" : "";
       tilesEl.appendChild(el);
-      tiles.set(p.k, { el: el, at: now });
+      if (old) {
+        if (fade) dying.push({ el: old.el, at: now });
+        else old.el.remove();
+      }
+      tiles.set(p.k, { el: el, at: now, fade: fade });
     }
     pending = [];
     while (dying.length && (reduceMotion || now - dying[0].at > FADE)) dying.shift().el.remove();
@@ -5007,34 +5046,41 @@ function CORE(env) {
         var covered = true;
         for (var k = Math.max(0, Math.floor(st.x0 / units)), k1 = Math.floor((st.x1 - 0.01) / units); k <= k1 && covered; k++) {
           var t = tiles.get(k);
-          covered = !!t && now - t.at > FADE;
+          covered = !!t && (!t.fade || now - t.at > FADE);
         }
-        if (covered || now - st.at > 8000) { st.el.remove(); return false; }
+        if (covered || !staleInView(st) || now - st.at > 8000) { st.el.remove(); return false; }
         return true;
       });
     }
     dropFarTiles();
     growTrack(false);
   }
-  // keep a generous window around the view, bounded by a tile budget
-  function dropFarTiles() {
-    var p = pos() - frontPx;
-    var lo = Math.floor((p - viewW * 3) / tileCss), hi = Math.floor((p + viewW * 4.5) / tileCss);
-    var budget = Math.max(28, Math.ceil((viewW / tileCss) * 4.6));
-    var gone = [];
+  // Eviction. Tiles inside the painter's range are never dropped (dropping one would just
+  // make the painter repaint it). Beyond that range, up to three more views of tiles are
+  // kept so that turning around does not repaint what was just seen; the furthest go first.
+  function dropFarTiles(all) {
+    var w = wantRange();
+    var lo = Math.min(w.lo, sentRange.lo), hi = Math.max(w.hi, sentRange.hi);
+    var inRange = hi - lo + 1;
+    var extra = Math.ceil((viewW / tileCss) * 3);
+    var memCap = Math.floor(640e6 / (TILE * Hpx * 4)); // about 640 MB of tile pixels at most
+    var budget = all ? 0 : Math.max(inRange + 2, Math.min(inRange + extra, memCap));
+    if (tiles.size <= budget) return;
+    var outside = [];
     tiles.forEach(function(rec, k) {
-      if (k < lo || k > hi) gone.push(k);
+      if (k < lo || k > hi) outside.push(k);
     });
-    if (tiles.size - gone.length > budget) {
-      var mid = (p + viewW * 0.9) / tileCss; // slightly ahead of centre: what lies ahead is worth more
-      var rest = [];
-      tiles.forEach(function(rec, k) { if (k >= lo && k <= hi) rest.push(k); });
-      rest.sort(function(x, y) { return Math.abs(y - mid) - Math.abs(x - mid); });
-      for (var i = 0; i < rest.length && tiles.size - gone.length > budget; i++) gone.push(rest[i]);
+    outside.sort(function(x, y) {
+      return (y < lo ? lo - y : y - hi) - (x < lo ? lo - x : x - hi);
+    });
+    var gone = [];
+    for (var i = 0; i < outside.length && tiles.size > budget; i++) {
+      var k = outside[i];
+      tiles.get(k).el.remove();
+      tiles.delete(k);
+      gone.push(k);
     }
-    if (!gone.length) return;
-    gone.forEach(function(k) { tiles.get(k).el.remove(); tiles.delete(k); });
-    send({ t: "drop", ks: gone });
+    if (gone.length) send({ t: "drop", ks: gone });
   }
 
   // ---- the painter: a worker when the page allows one, time-sliced on this thread otherwise ----
@@ -5151,7 +5197,8 @@ function CORE(env) {
     lastSentPos = p;
     lastSentT = now;
     var a = (p - frontPx) / s;
-    send({ t: "view", a: a, b: a + viewW / s });
+    sentRange = wantRange();
+    send({ t: "view", a: a, b: a + viewW / s, lo: sentRange.lo, hi: sentRange.hi });
   }
 
   function startPainting(newSeed) {
@@ -5166,7 +5213,7 @@ function CORE(env) {
     view.scrollLeft = 0;
     growTrack(true);
     painter = makePainter(seed);
-    if (H) send({ t: "layout", ep: ++epoch, P: TILE, Hpx: Hpx, q: Hpx / VB_H, dpr: dpr });
+    if (H) send({ t: "layout", ep: ++epoch, P: TILE, Hpx: Hpx, q: Hpx / VB_H, dpr: dpr, front: frontPx });
     send({ t: "palette", ep: ++epoch, pal: paletteTable(paletteKey) });
     sendView(true);
     holdUntil = performance.now() + 7000;
@@ -5179,6 +5226,8 @@ function CORE(env) {
   var holdUntil = 0;
   var lastT = 0;
   var drag = null, vel = 0;
+  var scrollSpeed = 0, speedX = 0, speedT = 0; // px/s, smoothed, from scroll events
+  var wheelTarget = null, wheelSet = 0; // eased travel for a notched mouse wheel
 
   function setDrift(on) {
     drifting = on;
@@ -5203,27 +5252,38 @@ function CORE(env) {
   view.addEventListener("scroll", function() {
     var now = performance.now();
     if (now - programmatic > 60) { userTook(); lastScrollEv = now; }
+    var x = view.scrollLeft;
+    if (now - speedT > 250) scrollSpeed = 0;
+    else if (now > speedT) scrollSpeed += ((Math.abs(x - speedX) / (now - speedT)) * 1000 - scrollSpeed) * 0.3;
+    speedX = x;
+    speedT = now;
     sendView(false);
   }, { passive: true });
-  view.addEventListener("touchstart", userTook, { passive: true });
+  view.addEventListener("touchstart", function() { wheelTarget = null; userTook(); }, { passive: true });
   view.addEventListener("wheel", function(e) {
     userTook();
-    // a plain mouse wheel only scrolls vertically: send that along the scroll instead
+    // A plain mouse wheel only scrolls vertically, in notches. Send that along the scroll,
+    // eased toward a running target each frame so a notch is a glide and not a jump.
+    // Horizontal (trackpad) input is left to the browser.
     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
       var k = e.deltaMode === 1 ? 18 : e.deltaMode === 2 ? viewW : 1;
-      view.scrollLeft += e.deltaY * k;
-    }
+      var from = wheelTarget === null ? view.scrollLeft : wheelTarget;
+      wheelTarget = Math.max(0, Math.min(view.scrollWidth - viewW, from + e.deltaY * k));
+      wheelSet = view.scrollLeft;
+      vel = 0;
+    } else wheelTarget = null;
   }, { passive: true });
   view.addEventListener("keydown", function(e) {
     if (e.target !== view) return;
     if (e.key === " ") { setDrift(!drifting); e.preventDefault(); }
-    else if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home") userTook();
+    else if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home") { wheelTarget = null; userTook(); }
   });
   // mouse drag (touch and trackpads scroll natively)
   view.addEventListener("pointerdown", function(e) {
     if (e.pointerType !== "mouse" || e.button !== 0) return;
     userTook();
     vel = 0;
+    wheelTarget = null;
     drag = { id: e.pointerId, x: e.clientX, x0: e.clientX, moved: false, samples: [{ t: performance.now(), x: e.clientX }] };
   });
   view.addEventListener("pointermove", function(e) {
@@ -5266,7 +5326,27 @@ function CORE(env) {
       requestAnimationFrame(frame);
       return;
     }
-    if (Math.abs(vel) > 8 && !drag) {
+    if (wheelTarget !== null) {
+      var cur = view.scrollLeft;
+      if (Math.abs(cur - wheelSet) > 3) wheelTarget = null; // something else moved the scroll: let go
+      else {
+        var gap = wheelTarget - cur;
+        var step = gap * (1 - Math.exp(-dt * 14));
+        var least = 1 / Math.max(1, Math.round(dpr)); // smallest move the scroller will accept
+        if (Math.abs(step) < least) step = Math.abs(gap) <= least ? gap : gap > 0 ? least : -least;
+        view.scrollLeft = cur + step;
+        wheelSet = view.scrollLeft;
+        if (wheelSet === cur) {
+          // the scroller rounded the move away: take a whole pixel, and stop if that fails too
+          view.scrollLeft = cur + (gap > 0 ? 1 : -1) * Math.min(1, Math.abs(gap));
+          wheelSet = view.scrollLeft;
+          if (wheelSet === cur) wheelTarget = null;
+        }
+        if (wheelTarget !== null && Math.abs(wheelTarget - wheelSet) < least) wheelTarget = null;
+        userUntil = t + 1800;
+        lastScrollEv = t;
+      }
+    } else if (Math.abs(vel) > 8 && !drag) {
       // coasting after a mouse drag
       view.scrollLeft += vel * dt;
       vel *= Math.exp(-dt * 3.4);
@@ -5299,6 +5379,7 @@ function CORE(env) {
     tiles: function() { return tiles.size; },
     pending: function() { return pending.length; },
     received: function() { return received; },
+    repeats: function() { return repeats; },
     flushes: function() { return flushes; },
     stale: function() { return stale.length; },
   };
